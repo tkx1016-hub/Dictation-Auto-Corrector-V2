@@ -1,5 +1,6 @@
 {
   "name": "Remix: Dictation Auto-Corrector",
   "description": "An AI-powered tool to automatically correct handwritten English and Chinese dictation assignments against provided answers.",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
