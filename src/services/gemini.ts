@@ -59,7 +59,7 @@ export async function ocrHandwrittenAnswer(base64Image: string, mimeType: string
   try {
     const ai = getAIInstance();
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-flash-latest",
       contents: [
         {
           parts: [
@@ -113,7 +113,7 @@ export async function correctAssignment(
     `;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-flash-latest",
       contents: [
         {
           parts: [
