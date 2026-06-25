@@ -55,82 +55,11 @@ function getAIInstance() {
   });
 }
 
-/**
- * 具有自动重试与多模型备用降级机制的 API 调用封装器。
- * 针对 503 (high demand)、429 (rate limit) 等常见暂时性负载错误，
- * 会在同一模型上退避重试，若仍然失败，则自动无缝降级切换至备用模型。
- */
-async function runWithFallbackAndRetry<T>(
-  apiCall: (model: string) => Promise<T>
-): Promise<T> {
-  // 按推荐度和稳定性排序的可用模型列表
-  const models = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"];
-  let lastError: any = null;
-
-  for (let i = 0; i < models.length; i++) {
-    const model = models[i];
-    
-    // 针对每个模型最多尝试 2 次（避免频繁失败导致总响应过长）
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        console.log(`[Gemini API] 正在尝试使用模型: ${model} (第 ${attempt}/2 次尝试)...`);
-        return await apiCall(model);
-      } catch (error: any) {
-        lastError = error;
-        const errMsg = (error.message || String(error)).toLowerCase();
-        console.warn(`[Gemini API] 模型 ${model} 在第 ${attempt} 次尝试中出错:`, error.message || error);
-
-        // 检测是否属于暂时性高负载/限流错误 (503 / 429 / overloaded / high demand)
-        const isTransient = 
-          errMsg.includes("503") || 
-          errMsg.includes("high demand") || 
-          errMsg.includes("service unavailable") || 
-          errMsg.includes("429") || 
-          errMsg.includes("resourceexhausted") ||
-          errMsg.includes("rate limit") ||
-          errMsg.includes("overloaded") ||
-          errMsg.includes("busy") ||
-          errMsg.includes("temp");
-
-        if (isTransient) {
-          if (attempt === 2) {
-            // 该模型重试2次均失败，输出日志并尝试下一个备用模型
-            console.log(`[Gemini API] 模型 ${model} 暂时不可用，准备自动切换至备用模型...`);
-            break; 
-          }
-          // 退避重试同一模型
-          const delay = attempt * 1500;
-          console.log(`[Gemini API] 检测到暂时性负载过高，将在 ${delay}ms 后重试该模型...`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        } else {
-          // 如果是非负载类错误（如 API key 错误、权限错误），直接抛出，无需轮询其他模型
-          if (
-            errMsg.includes("api key") || 
-            errMsg.includes("key not found") || 
-            errMsg.includes("unauthorized") || 
-            errMsg.includes("401") || 
-            errMsg.includes("403")
-          ) {
-            throw error;
-          }
-          // 其他非关键错误且到最后一次尝试，也切换模型
-          if (attempt === 2) {
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-      }
-    }
-  }
-
-  throw new Error(`所有可用的 Gemini AI 线路目前均处于极高负载状态，请稍后重试。最后一次线路错误详情: ${lastError?.message || lastError || "未知服务错误"}`);
-}
-
 export async function ocrHandwrittenAnswer(base64Image: string, mimeType: string): Promise<string> {
-  return runWithFallbackAndRetry(async (modelName) => {
+  try {
     const ai = getAIInstance();
     const response = await ai.models.generateContent({
-      model: modelName,
+      model: "gemini-3.5-flash",
       contents: [
         {
           parts: [
@@ -146,10 +75,10 @@ export async function ocrHandwrittenAnswer(base64Image: string, mimeType: string
     }
     
     return response.text;
-  }).catch((error: any) => {
+  } catch (error: any) {
     console.error("OCR Error:", error);
     throw new Error(`标准答案识别失败: ${error.message || "未知错误"}`);
-  });
+  }
 }
 
 export async function correctAssignment(
@@ -157,34 +86,34 @@ export async function correctAssignment(
   mimeType: string,
   answerText: string
 ): Promise<CorrectionItem[]> {
-  const prompt = `
-    你是一位专业的语言老师。现在需要对一张手写听写作业（图片）进行自动批改。
-    标准答案（包含英文拼写、词性、中文意思三项）为: 
-    """
-    ${answerText}
-    """
-    
-    任务要求：
-    1. 识别学生在作业图片中书写的所有听写项。
-    2. 针对每一个听写项，分别从以下共三项内容进行核对批改：
-       - 英文拼写 (Spelling): 要求严格，全词拼写必须正确。
-       - 词性 (Part of Speech): 词性缩写（如 n., v., adj., adv., prep., pron. 等）是必须书写的内容。
-         - 【词性必写与严格扣分规则】：在听写作业中，学生必须书写对应的词性缩写。如果学生在手写作业中完全没有写词性，或者漏写了词性缩写，你必须判定其词性为错误 (posCorrect: false)，实际写的词性 (posActual) 记录为 "未写"，且这一整项的是否完全正确 (isCorrect) 必须判定为 false（即扣分）。绝不能因为学生没写词性就自动判对或不扣分！
-         - 即使标准答案中由于OCR或其他原因缺失了词性，如果学生未写词性，也必须判定其词性为错误 (posCorrect: false) 并判定此项不正确 (isCorrect: false)。
-       - 中文意思 (Meaning): 极大放宽！实行非常宽容的“意对即可”和“部分字词匹配”规则：
-         - 准许学生只写标准答案中的部分汉字，甚至仅写出其中任意一个字即算正确（例如：标准答案“字典”，学生写“典”或“字”即对；标准“美丽的”，学生写“美”即对；标准“拼写”，学生写“拼”即对）。
-         - 任何意义相近、同义词、近义词表达均视为完全正确并得分（例如：标准答案是“纠正”，学生写“改”、“改正”、“对的”、“纠”等均应算对）。
-         - 只要学生手写的中文意思与标准答案存在任何语义交叉、包含关系、核心字重合或意思相近，一律判定为正确 (meaningCorrect: true)。
-    3. 判定该听写项的整体是否完全正确 (isCorrect). 仅当英文拼写、词性、中文意思这三项按各自评判标准全部为正确时，此项才为 true。
-    4. 如果某项有任何错误，请提供它在图像中对应的边界框 [ymin, xmin, ymax, xmax]，坐标值归一化在 0 - 1000 之间。
-    
-    返回的结果必须是一个符合以下 JSON Schema 格式的 JSON 数组。
-  `;
-
-  return runWithFallbackAndRetry(async (modelName) => {
+  try {
     const ai = getAIInstance();
+    const prompt = `
+      你是一位专业的语言老师。现在需要对一张手写听写作业（图片）进行自动批改。
+      标准答案（包含英文拼写、词性、中文意思三项）为: 
+      """
+      ${answerText}
+      """
+      
+      任务要求：
+      1. 识别学生在作业图片中书写的所有听写项。
+      2. 针对每一个听写项，分别从以下共三项内容进行核对批改：
+         - 英文拼写 (Spelling): 要求严格，全词拼写必须正确。
+         - 词性 (Part of Speech): 词性缩写（如 n., v., adj., adv., prep., pron. 等）是必须书写的内容。
+           - 【词性必写与严格扣分规则】：在听写作业中，学生必须书写对应的词性缩写。如果学生在手写作业中完全没有写词性，或者漏写了词性缩写，你必须判定其词性为错误 (posCorrect: false)，实际写的词性 (posActual) 记录为 "未写"，且这一整项的是否完全正确 (isCorrect) 必须判定为 false（即扣分）。绝不能因为学生没写词性就自动判对或不扣分！
+           - 即使标准答案中由于OCR或其他原因缺失了词性，如果学生未写词性，也必须判定其词性为错误 (posCorrect: false) 并判定此项不正确 (isCorrect: false)。
+         - 中文意思 (Meaning): 极大放宽！实行非常宽容的“意对即可”和“部分字词匹配”规则：
+           - 准许学生只写标准答案中的部分汉字，甚至仅写出其中任意一个字即算正确（例如：标准答案“字典”，学生写“典”或“字”即对；标准“美丽的”，学生写“美”即对；标准“拼写”，学生写“拼”即对）。
+           - 任何意义相近、同义词、近义词表达均视为完全正确并得分（例如：标准答案是“纠正”，学生写“改”、“改正”、“对的”、“纠”等均应算对）。
+           - 只要学生手写的中文意思与标准答案存在任何语义交叉、包含关系、核心字重合或意思相近，一律判定为正确 (meaningCorrect: true)。
+      3. 判定该听写项的整体是否完全正确 (isCorrect)。仅当英文拼写、词性、中文意思这三项按各自评判标准全部为正确时，此项才为 true。
+      4. 如果某项有任何错误，请提供它在图像中对应的边界框 [ymin, xmin, ymax, xmax]，坐标值归一化在 0 - 1000 之间。
+      
+      返回的结果必须是一个符合以下 JSON Schema 格式的 JSON 数组。
+    `;
+
     const response = await ai.models.generateContent({
-      model: modelName,
+      model: "gemini-3.5-flash",
       contents: [
         {
           parts: [
@@ -247,8 +176,8 @@ export async function correctAssignment(
     }
 
     return JSON.parse(response.text);
-  }).catch((error: any) => {
+  } catch (error: any) {
     console.error("Correction Error:", error);
     throw new Error(`作业批改失败: ${error.message || "未知错误"}`);
-  });
+  }
 }
